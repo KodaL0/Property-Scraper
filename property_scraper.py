@@ -18,11 +18,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+from urllib.parse import urljoin, urlparse
+
 
 # ========= Image conversion (WEBP → JPEG) =========
 CONVERT_WEBP_TO_JPEG = True  # enable to maximize backend compatibility
 try:
-    from PIL import Image  # pip install pillow
+    from PIL import Image  # pip install pillow (and optionally pillow-avif-plugin)
 except Exception:
     Image = None
 
@@ -74,6 +76,27 @@ def first_text(soup: BeautifulSoup, selectors: List[str]) -> Optional[str]:
             continue
     return None
 
+def session_with_cookies(driver, page_url: str) -> requests.Session:
+    """
+    Build a requests.Session that carries over Selenium cookies and
+    sets a proper UA + Referer so the image host doesn't block us.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Referer": page_url,
+        "Accept": "image/*",
+    })
+    host = urlparse(page_url).hostname or ""
+    for ck in driver.get_cookies():
+        # Keep only cookies relevant to the current host
+        dom = ck.get("domain") or host
+        if dom.startswith("."):
+            dom = dom[1:]
+        if dom in host or host.endswith(dom):
+            s.cookies.set(ck["name"], ck["value"], domain=ck.get("domain"), path=ck.get("path", "/"))
+    return s
+
 def all_texts(soup: BeautifulSoup, selectors: List[str]) -> List[str]:
     out = []
     for sel in selectors:
@@ -83,25 +106,100 @@ def all_texts(soup: BeautifulSoup, selectors: List[str]) -> List[str]:
                 out.append(t)
     return out
 
+def _sniff_image_format(b: bytes) -> Optional[str]:
+    if not b or len(b) < 12:
+        return None
+    # JPEG
+    if b[:2] == b"\xFF\xD8":
+        return "jpeg"
+    # PNG
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    # GIF
+    if b[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    # WEBP (RIFF...WEBP)
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "webp"
+    # AVIF (ftypavif/…)
+    if b[:4] == b"\x00\x00\x00\x20" and b[4:8] == b"ftyp" and b[8:12] in (b"avif", b"heic", b"heix", b"hevc"):
+        return "avif"
+    return None
+
 def to_int(text: Optional[str]) -> Optional[int]:
     if not text:
         return None
     m = re.search(r"(\d+)", text.replace("\xa0", " "))
     return int(m.group(1)) if m else None
 
-def to_float(text: Optional[str]) -> Optional[float]:
-    if not text:
+def _parse_money_to_str(s: Optional[str]) -> Optional[str]:
+    """
+    Robustly parse currency strings:
+    - Handles 280.000 -> 280000.00  (dot as thousands)
+    - Handles 180,000 -> 180000.00  (comma as thousands)
+    - Handles 1.200.000,50 -> 1200000.50  (EU format)
+    - Handles 1,200,000.50 -> 1200000.50  (US format)
+    - Ignores words like '+ VAT', '/month', currency symbols, spaces
+    """
+    if not s:
         return None
-    m = re.search(r"(\d+(?:[.,]\d+)?)", text.replace("\xa0", " "))
-    if not m:
+    s = s.strip()
+    # keep only digits, dot, comma
+    raw = re.sub(r"[^0-9\.,]", "", s)
+    if not raw:
         return None
-    return float(m.group(1).replace(",", "."))
 
-def money_to_string_amount(text: Optional[str]) -> Optional[str]:
-    f = to_float(text)
-    if f is None:
+    # If both separators present, decide decimal by last occurrence
+    if "." in raw and "," in raw:
+        last_dot = raw.rfind(".")
+        last_comma = raw.rfind(",")
+        if last_comma > last_dot:
+            # EU style: thousands='.', decimal=','
+            thousands, decimal = ".", ","
+        else:
+            # US style: thousands=',', decimal='.'
+            thousands, decimal = ",", "."
+        tmp = raw.replace(thousands, "")
+        tmp = tmp.replace(decimal, ".")
+        try:
+            val = float(tmp)
+            return f"{val:.2f}"
+        except Exception:
+            pass
+
+    # Only one separator or none
+    if "," in raw and "." not in raw:
+        # Could be thousands or decimal; if last group has exactly 2 digits, treat as decimal
+        parts = raw.split(",")
+        if len(parts[-1]) == 2:
+            tmp = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            tmp = "".join(parts)  # thousands commas
+        try:
+            val = float(tmp)
+            return f"{val:.2f}"
+        except Exception:
+            return None
+
+    if "." in raw and "," not in raw:
+        parts = raw.split(".")
+        # If last group has 2 digits, assume decimal. Else, dot is thousands sep.
+        if len(parts[-1]) == 2:
+            tmp = ".".join(parts)
+        else:
+            tmp = "".join(parts)
+        try:
+            val = float(tmp)
+            return f"{val:.2f}"
+        except Exception:
+            return None
+
+    # No separators, plain integer
+    try:
+        val = float(raw)
+        return f"{val:.2f}"
+    except Exception:
         return None
-    return f"{f:.2f}"
 
 def normalize_whitespace(s: Optional[str]) -> Optional[str]:
     if not s:
@@ -269,31 +367,73 @@ def extract_images_robust(html: str, soup: BeautifulSoup) -> List[str]:
 # =========================
 # ---- AMENITIES MAP ------
 # =========================
+# Map keyword(s) → (id, label, category) matching your platform
 AMENITY_KEYWORDS = [
-    (["parking", "garage", "car park", "open parking", "covered parking"], ("parking", "Parking", "Legacy")),
-    (["balcony", "veranda", "terrace", "patio"], ("balcony", "Balcony", "Exterior")),
-    (["garden", "yard", "private garden"], ("garden", "Garden", "Exterior")),
-    (["roof", "roof deck", "roof-deck", "rooftop", "roof terrace"], ("roofDeck", "roofDeck", "Unknown")),
-    (["security", "alarm", "cctv", "security door", "gated"], ("security", "security", "Unknown")),
-    (["air conditioning", "a/c", "ac", "κλιματισμός"], ("ac", "Air Conditioning", "Legacy")),
-    (["storage", "storeroom", "storage room"], ("storage", "Storage Space", "Interior")),
-    (["pet", "pets allowed", "pet-friendly"], ("pets", "Pet Friendly", "Policy")),
-    (["sea view", "seaview", "waterfront", "beachfront", "on the sea", "by the sea"], ("waterfront", "Waterfront", "Location")),
-    (["bbq", "barbeque", "barbecue"], ("bbq", "BBQ", "Exterior")),
-    (["elevator", "lift"], ("elevator", "Elevator", "Interior")),
-    ((["fireplace"]), ("fireplace", "Fireplace", "Interior")),
-    (["solar water", "solar heater"], ("solar", "Solar Water Heater", "Utilities")),
+    # --- Parking ---
+    (["parking", "parking space", "car park", "open parking", "covered parking",
+      "θέση στάθμευσης", "σταθμευ", "παρκινγκ"],
+     ("parking_space", "Parking Space", "Parking")),
+
+    # --- Exterior ---
+    (["balcony", "veranda", "terrace", "patio", "βεράντα", "μπαλκόνι", "ταράτσα"],
+     ("balcony", "Balcony", "Exterior")),
+    (["garden", "yard", "private garden", "κήπος", "αυλή"],
+     ("garden", "Garden", "Exterior")),
+    (["roof deck", "rooftop", "roof terrace", "δώμα"],
+     ("roof_deck", "Roof Deck", "Exterior")),
+    (["bbq", "barbeque", "barbecue", "μπάρμπεκιου"],
+     ("bbq", "BBQ", "Exterior")),
+
+    # --- Building ---
+    (["corner", "γωνιακό"],
+     ("corner", "Corner", "Building")),
+    (["elevator", "lift", "ασανσέρ", "ανελκυστήρας"],
+     ("elevator", "Elevator", "Building")),
+
+    # --- Interior ---
+    (["bright", "luminous", "φωτεινό", "ηλιόλουστο"],
+     ("bright", "Bright", "Interior")),
+    (["storage", "storeroom", "storage room", "αποθήκη"],
+     ("storage", "Storage Space", "Interior")),
+    (["fireplace", "τζάκι"],
+     ("fireplace", "Fireplace", "Interior")),
+
+    # --- Climate ---
+    (["air conditioning", "a/c", "ac", "κλιματισμός"],
+     ("air_conditioning", "Air Conditioning", "Climate")),
+    (["central heating", "radiator heating", "θέρμανση", "κεντρική θέρμανση"],
+     ("central_heating", "central_heating", "Unknown")),  # as per your sample
+
+    # --- Utilities ---
+    (["solar water", "solar heater", "ηλιακός", "ηλιακός θερμοσίφωνας"],
+     ("solar", "Solar Water Heater", "Utilities")),
+    (["security", "alarm", "cctv", "security door", "gated", "συναγερμός", "πόρτα ασφαλείας"],
+     ("security", "security", "Unknown")),
+
+    # --- Location ---
+    (["view", "sea view", "mountain view", "θέα", "θέα θάλασσα"],
+     ("view", "View", "Location")),
+    (["waterfront", "beachfront", "on the sea", "by the sea", "παραθαλάσσιο", "παραλία"],
+     ("waterfront", "Waterfront", "Location")),
+
+    # --- Policy ---
+    (["pets", "pet friendly", "pets allowed", "κατοικίδια"],
+     ("pet_friendly", "Pet Friendly", "Policy")),
 ]
 
 def map_amenities(features_texts: List[str]) -> Tuple[List[str], List[Dict[str, str]]]:
     raw_ids_ordered: List[str] = []
     detailed_map: Dict[str, Dict[str, str]] = {}
+
     blob = " | ".join(ft.lower() for ft in features_texts)
+
     for keywords, (aid, label, category) in AMENITY_KEYWORDS:
-        if any(k.lower() in blob for k in (keywords if isinstance(keywords, list) else [keywords])):
+        kws = keywords if isinstance(keywords, list) else [keywords]
+        if any(k.lower() in blob for k in kws):
             if aid not in raw_ids_ordered:
                 raw_ids_ordered.append(aid)
             detailed_map[aid] = {"id": aid, "label": label, "category": category}
+
     amenities_detailed = [detailed_map[aid] for aid in raw_ids_ordered if aid in detailed_map]
     return raw_ids_ordered, amenities_detailed
 
@@ -306,7 +446,8 @@ def gather_feature_texts(soup: BeautifulSoup) -> List[str]:
     # 1) Headers that say Features/Main/Further Features → collect next <ul>/<ol> items
     for h in soup.find_all(["h2", "h3"]):
         ht = h.get_text(" ", strip=True).lower()
-        if any(k in ht for k in ["features", "main features", "further features", "other features", "amenities"]):
+        if any(k in ht for k in ["features", "main features", "further features", "other features",
+                                 "amenities", "χαρακτηριστικ", "παροχές"]):
             ul = h.find_next_sibling()
             hop = 0
             while ul and hop < 4 and ul.name not in ("ul", "ol"):
@@ -321,7 +462,7 @@ def gather_feature_texts(soup: BeautifulSoup) -> List[str]:
     # 2) Any list with amenity/feature in class name
     for ul in soup.find_all("ul"):
         cls = " ".join(ul.get("class", []))
-        if re.search(r"(amenit|feature)", cls, re.I):
+        if re.search(r"(amenit|feature|χαρακτηριστικ|παροχ)", cls, re.I):
             for li in ul.find_all("li"):
                 t = li.get_text(" ", strip=True)
                 if t:
@@ -333,20 +474,102 @@ def gather_feature_texts(soup: BeautifulSoup) -> List[str]:
         if t:
             texts.append(t)
 
+    # 4) Tokenize description / page text by common separators (helps Greek comma-separated lists)
+    page_text = soup.get_text("\n", strip=True)
+    for chunk in re.split(r"[•·\-\u2022,\n;/|]+", page_text):
+        c = chunk.strip()
+        if 2 <= len(c) <= 60:  # lightweight noise filter
+            texts.append(c)
+
     # dedupe while preserving order
     seen, out = set(), []
     for t in texts:
-        if t not in seen:
-            seen.add(t)
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
             out.append(t)
     return out
+
+def parse_price(soup: BeautifulSoup, html: str) -> Optional[str]:
+    """
+    Prefer JSON-LD offers.price / aggregateOffer.lowPrice/highPrice,
+    then itemprop price/meta, then visible '.price' blocks,
+    then a last-resort regex near currency symbols.
+    Always return '123456.78' string or None.
+    """
+    # 1) JSON-LD
+    for sc in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(sc.string or "")
+            nodes = data if isinstance(data, list) else [data]
+            for obj in nodes:
+                offers = obj.get("offers")
+                if not offers:
+                    continue
+                # offers can be dict or list
+                off_list = offers if isinstance(offers, list) else [offers]
+                for off in off_list:
+                    # aggregate
+                    for key in ("price", "lowPrice", "highPrice", "minPrice", "maxPrice"):
+                        if key in off and off.get(key):
+                            s_val = str(off.get(key))
+                            parsed = _parse_money_to_str(s_val)
+                            if parsed:
+                                return parsed
+        except Exception:
+            pass
+
+    # 2) Microdata / itemprop price
+    for el in soup.select('[itemprop="price"], meta[itemprop="price"], [content*="price"]'):
+        txt = el.get("content") or el.get_text(" ", strip=True)
+        parsed = _parse_money_to_str(txt)
+        if parsed:
+            return parsed
+
+    # 3) Visible price blocks (tighten selectors to avoid areas)
+    candidates = []
+    # common price containers
+    for sel in [
+        ".price", ".property-price", ".listing-price", "[data-testid='price']",
+        "[class*='price']", "span.price", "strong.price"
+    ]:
+        for el in soup.select(sel):
+            t = el.get_text(" ", strip=True)
+            if t:
+                candidates.append(t)
+
+    for t in candidates:
+        # ignore obvious non-price lines
+        if re.search(r"\b(area|sqm|m2|m²|plot|bed|bath|storey|floor)\b", t, re.I):
+            continue
+        parsed = _parse_money_to_str(t)
+        if parsed:
+            return parsed
+
+    # 4) Last-resort regex: look for a currency marker near a number
+    # Try to find a €/$ sign or 'EUR' within 50 chars of a number
+    m = re.search(r"(€|EUR|\$)\s*([0-9][\d\.\, ]*(?:[.,]\d{2})?)", html, re.I)
+    if m:
+        parsed = _parse_money_to_str(m.group(0))
+        if parsed:
+            return parsed
+
+    # Final fallback: first big number that looks like a money amount
+    m2 = re.search(r"\b\d{1,3}(?:[.,]\d{3}){1,4}(?:[.,]\d{2})?\b", html)
+    if m2:
+        parsed = _parse_money_to_str(m2.group(0))
+        if parsed:
+            return parsed
+
+    return None
+
 
 def parse_gogordian(html: str, url: str) -> Optional[Dict]:
     soup = BeautifulSoup(html, "html.parser")
 
     # Title & price
     title = normalize_whitespace(first_text(soup, ["h1", "h1.property-title", "div.property-title h1"]))
-    price = money_to_string_amount(first_text(soup, [".price", "[data-testid='price']", "h1 + div, h1 + *"]))
+    price = parse_price(soup, html)
 
     # Description
     description = extract_description(soup) or "No description provided."
@@ -393,7 +616,10 @@ def parse_gogordian(html: str, url: str) -> Optional[Dict]:
             m = re.search(rf"{re.escape(label)}\s*[:\-]?\s*([\d\.,]+)\s*(?:m2|m²|sqm|sq\.? m)?",
                           page_txt, re.IGNORECASE)
             if m:
-                return to_float(m.group(1))
+                # area can have thousands separators; use the same robust parser then cast to int/float
+                parsed = _parse_money_to_str(m.group(1))
+                if parsed is not None:
+                    return float(parsed)
         return None
 
     area_num = find_labeled_number(["Covered Area", "Total Covered Area", "Internal Area", "Area"])
@@ -475,7 +701,7 @@ def parse_gogordian(html: str, url: str) -> Optional[Dict]:
         "street": street or "",
         "latitude": latitude or "",
         "longitude": longitude or "",
-        "bedrooms": bedrooms if isinstance(bedrooms, int) else (int(float(bathrooms)) if isinstance(bathrooms, str) and re.match(r"^\d+(\.\d+)?$", bathrooms) else 0),
+        "bedrooms": bedrooms if isinstance(bedrooms, int) else (int(float(bedrooms)) if isinstance(bedrooms, str) and re.match(r"^\d+(\.\d+)?$", bedrooms) else 0),
         "bathrooms": str(bathrooms) if bathrooms is not None else "0",
         "area": int(area_num) if area_num is not None else 0,
         "year_built": year_built if year_built is not None else 0,
@@ -517,58 +743,117 @@ def guess_mime_from_ext(filename: str) -> str:
     mime, _ = mimetypes.guess_type(filename)
     return mime or "application/octet-stream"
 
-def fetch_image_bytes(session: requests.Session, url: str, idx: int, referer: str) -> Optional[Tuple[str, bytes, str]]:
+def fetch_image_bytes(session: requests.Session, url: str, idx: int) -> Optional[Tuple[str, bytes, str]]:
     try:
-        r = session.get(url, timeout=HTTP_TIMEOUT, stream=True, headers={"Referer": referer})
+        r = session.get(url, timeout=HTTP_TIMEOUT, stream=True)
+        if r.status_code != 200:
+            r = session.get(url, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
-        content = r.content
-        filename = guess_filename(url, idx)
-        mime = r.headers.get("Content-Type") or guess_mime_from_ext(filename)
 
-        # Optional: convert WEBP → JPEG
-        if CONVERT_WEBP_TO_JPEG and Image is not None and ("image/webp" in mime or filename.lower().endswith(".webp")):
+        content = r.content or b""
+        # Skip empty/tiny files (< 5 KB)
+        if len(content) < 5 * 1024:
+            return None
+
+        # MIME from server, but we'll verify ourselves too
+        mime = (r.headers.get("Content-Type") or "").lower()
+
+        # Skip obvious non-images (html/svg)
+        if "text/html" in mime or "svg" in mime:
+            return None
+
+        # Sniff actual format from bytes
+        sniff = _sniff_image_format(content)
+
+        # If still unknown, try Pillow verify
+        fmt_from_pillow = None
+        if sniff is None and Image is not None:
             try:
-                img = Image.open(io.BytesIO(content)).convert("RGB")
+                im = Image.open(io.BytesIO(content))
+                im.verify()  # quick integrity check
+                fmt_from_pillow = (im.format or "").lower()
+            except Exception:
+                return None
+
+        fmt = sniff or fmt_from_pillow or ""
+        # Handle formats
+        if fmt == "webp" and CONVERT_WEBP_TO_JPEG and Image is not None:
+            try:
+                im = Image.open(io.BytesIO(content)).convert("RGB")
                 out_io = io.BytesIO()
-                img.save(out_io, format="JPEG", quality=90)
+                im.save(out_io, format="JPEG", quality=90)
                 content = out_io.getvalue()
-                filename = re.sub(r"\.webp$", ".jpg", filename, flags=re.I)
+                fmt = "jpeg"
                 mime = "image/jpeg"
             except Exception:
-                pass
+                return None
+        elif fmt == "avif":
+            if Image is not None:
+                try:
+                    im = Image.open(io.BytesIO(content)).convert("RGB")
+                    out_io = io.BytesIO()
+                    im.save(out_io, format="JPEG", quality=90)
+                    content = out_io.getvalue()
+                    fmt = "jpeg"
+                    mime = "image/jpeg"
+                except Exception:
+                    return None
+            else:
+                return None
+        elif fmt in ("jpeg", "png", "gif"):
+            if not mime.startswith("image/"):
+                mime = f"image/{fmt}"
+        else:
+            return None
 
-        # Ensure extension matches mime (simple cases)
-        if mime == "image/jpeg" and not filename.lower().endswith((".jpg", ".jpeg")):
+        # Filename & extension
+        filename = guess_filename(url, idx)
+        if fmt == "jpeg" and not filename.lower().endswith((".jpg", ".jpeg")):
             filename += ".jpg"
-        elif mime == "image/png" and not filename.lower().endswith(".png"):
+        elif fmt == "png" and not filename.lower().endswith(".png"):
             filename += ".png"
+        elif fmt == "gif" and not filename.lower().endswith(".gif"):
+            filename += ".gif"
 
         return filename, content, mime
     except Exception:
         return None
 
-def download_images(image_urls: List[str], page_url: str, max_images: int = MAX_IMAGES) -> List[Tuple[str, bytes, str]]:
+def _normalize_img_url(u: str, page_url: str) -> str:
+    if not u:
+        return ""
+    u = u.strip()
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return urljoin(page_url, u)
+    return u
+
+def download_images(image_urls: List[str], page_url: str, driver, max_images: int = MAX_IMAGES) -> List[Tuple[str, bytes, str]]:
     out: List[Tuple[str, bytes, str]] = []
-    s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    s = session_with_cookies(driver, page_url)
     seen = set()
     idx = 0
-    for u in image_urls:
-        if u in seen:
-            continue
-        seen.add(u)
-        idx += 1
-        res = fetch_image_bytes(s, u, idx, referer=page_url)
-        if res:
-            out.append(res)
+
+    for raw in image_urls:
         if len(out) >= max_images:
             break
+        url = _normalize_img_url(raw, page_url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        idx += 1
+
+        res = fetch_image_bytes(s, url, idx)   # verified fetcher
+        if res:
+            out.append(res)
+
     return out
 
 # =========================
 # ---- NETWORKING ----------
 # =========================
-def send_to_backend(property_data: Dict, page_url: str) -> Tuple[int, str]:
+def send_to_backend(property_data: Dict, page_url: str, driver) -> Tuple[int, str]:
     """
     POST as multipart/form-data.
     - Scalar fields in 'data'
@@ -584,7 +869,7 @@ def send_to_backend(property_data: Dict, page_url: str) -> Tuple[int, str]:
 
     # Download images with Referer
     image_urls = property_data.get("images") or []
-    image_blobs = download_images(image_urls, page_url)
+    image_blobs = download_images(image_urls, page_url, driver)
     if not image_blobs:
         return 400, '{"images":["No downloadable images"]}'
 
@@ -649,6 +934,9 @@ def scrape_once(driver: webdriver.Chrome, url: str) -> Optional[Dict]:
     # Help lazy loaders
     driver.execute_script("window.scrollTo(0, Math.min(1800, document.body.scrollHeight));")
     time.sleep(0.6)
+    # Extra scroll to help load galleries
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.75);")
+    time.sleep(0.8)
     html = driver.page_source
     payload = parse_gogordian(html, url)
     if not payload:
@@ -695,7 +983,7 @@ def main():
             print(f"[DEBUG] Images found: {len(payload.get('images', []))}")
 
             if POST_ENABLED:
-                status, body = send_to_backend(payload, url)
+                status, body = send_to_backend(payload, url, driver)
                 if status in (200, 201):
                     ok += 1
                     print(f"[OK] {status} {payload.get('title')}")
